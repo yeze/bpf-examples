@@ -23,6 +23,36 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME); // 将map pinned在/var/run/lixdp下
 } udp_xsks_map SEC(".maps");
 
+static __always_inline void swap_src_dst_mac(void *data)
+{
+	__u16 *p = data;
+	__u16 dst[3];
+
+	dst[0] = p[0];
+	dst[1] = p[1];
+	dst[2] = p[2];
+	p[0] = p[3];
+	p[1] = p[4];
+	p[2] = p[5];
+	p[3] = dst[0];
+	p[4] = dst[1];
+	p[5] = dst[2];
+}
+
+static __always_inline void swap_src_dst_ip(struct iphdr *iph)
+{
+	__u32 src = iph->saddr;
+	iph->saddr = iph->daddr;
+	iph->daddr = src;
+}
+
+static __always_inline void swap_src_dst_udp(struct udphdr *udph)
+{
+	__u16 src = udph->source;
+	udph->source = udph->dest;
+	udph->dest = src;
+}
+
 SEC("xdp_sock")
 int xdp_sock_prog(struct xdp_md *ctx) {
     __u32 off;
@@ -55,9 +85,15 @@ int xdp_sock_prog(struct xdp_md *ctx) {
     if (data + off > data_end) {
         return XDP_PASS;
     }
-    // 根据目的端口将流量redirect到相应socket, 未命中则pass
     int dport = bpf_ntohs(udph->dest);
-    return bpf_redirect_map(&udp_xsks_map, dport, XDP_PASS);
+    if (bpf_map_lookup_elem(&udp_xsks_map, &dport)) {
+        swap_src_dst_mac(ethh);
+        swap_src_dst_ip(iph);
+        swap_src_dst_udp(udph);
+
+        return XDP_TX;
+    }
+    return XDP_PASS;
 }
 
 char _license[] SEC("license") = "GPL";
