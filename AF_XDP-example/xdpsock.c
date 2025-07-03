@@ -145,6 +145,7 @@ static bool opt_tstamp;
 static struct xdp_program *xdp_prog;
 static bool opt_frags;
 static bool load_xdp_prog;
+static u16 dport = 8080;
 
 struct vlan_ethhdr {
 	unsigned char h_dest[6];
@@ -645,7 +646,7 @@ static void xdpsock_cleanup(void)
 			exit_with_error(errno);
 	}
 
-	if (load_xdp_prog)
+	//if (load_xdp_prog)
 		remove_xdp_program();
 }
 
@@ -659,6 +660,38 @@ static void swap_mac_addresses(void *data)
 	tmp = *src_addr;
 	*src_addr = *dst_addr;
 	*dst_addr = tmp;
+}
+
+static int swap_addresses(void *data)
+{
+	struct ether_header *eth = (struct ether_header *)data;
+	struct ether_addr *src_addr = (struct ether_addr *)&eth->ether_shost;
+	struct ether_addr *dst_addr = (struct ether_addr *)&eth->ether_dhost;
+	struct ether_addr tmp;
+
+	tmp = *src_addr;
+	*src_addr = *dst_addr;
+	*dst_addr = tmp;
+
+	struct iphdr *ip = (struct iphdr *)(eth + 1);
+	unsigned int *src_ip = &ip->saddr;
+	unsigned int *dst_ip = &ip->daddr;
+	unsigned int tmp_ip;
+
+	tmp_ip = *src_ip;
+	*src_ip = *dst_ip;
+	*dst_ip = tmp_ip;
+
+	struct udphdr *udp = (struct udphdr *)(ip + 1);
+	unsigned short *src_port = &udp->source;
+	unsigned short *dst_port = &udp->dest;
+	unsigned short tmp_port;
+
+	tmp_port = *src_port;
+	*src_port = *dst_port;
+	*dst_port = tmp_port;
+
+	return htons(ip->tot_len) + sizeof(struct ether_header);
 }
 
 static void hex_dump(void *pkt, size_t length, u64 addr)
@@ -1050,10 +1083,10 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	xsk->umem = umem;
 	cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
-	if (load_xdp_prog || opt_reduced_cap)
+	//if (load_xdp_prog || opt_reduced_cap)
 		cfg.libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
-	else
-		cfg.libxdp_flags = 0;
+	//else
+	//	cfg.libxdp_flags = 0;
 	if (opt_attach_mode == XDP_MODE_SKB)
 		cfg.xdp_flags = XDP_FLAGS_SKB_MODE;
 	else
@@ -1189,7 +1222,7 @@ static void parse_command_line(int argc, char **argv)
 
 	for (;;) {
 		c = getopt_long(argc, argv,
-				"rtli:q:pSNn:w:O:czf:muMd:b:C:s:P:VJ:K:G:H:T:yW:U:xQaI:BRF",
+				"rtli:q:pSNn:w:O:czf:muMd:b:C:s:P:VJ:K:G:H:T:yW:U:xQaI:BRFD:",
 				long_options, &option_index);
 		if (c == -1)
 			break;
@@ -1348,6 +1381,9 @@ static void parse_command_line(int argc, char **argv)
 		case 'F':
 			opt_frags = true;
 			break;
+		case 'D':
+			dport = atoi(optarg);
+			break;
 		default:
 			usage(basename(argv[0]));
 		}
@@ -1402,10 +1438,10 @@ static inline void complete_tx_l2fwd(struct xsk_socket_info *xsk)
 	 * is driven by the NAPI loop. So as an optimization, we do not have to call
 	 * sendto() all the time in zero-copy mode for l2fwd.
 	 */
-	if (opt_xdp_bind_flags & XDP_COPY) {
+	//if (opt_xdp_bind_flags & XDP_COPY) {
 		xsk->app_stats.copy_tx_sendtos++;
 		kick_tx(xsk);
-	}
+	//}
 
 	ndescs = (xsk->outstanding_tx > opt_batch_size) ? opt_batch_size :
 		xsk->outstanding_tx;
@@ -1751,20 +1787,21 @@ static void l2fwd(struct xsk_socket_info *xsk)
 		u64 addr = desc->addr;
 		u32 len = desc->len;
 		u64 orig = addr;
+		u32 size = len;
 
 		addr = xsk_umem__add_offset_to_addr(addr);
 		char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
 		if (!nb_frags++)
-			swap_mac_addresses(pkt);
+			size = swap_addresses(pkt);
 
-		hex_dump(pkt, len, addr);
+		hex_dump(pkt, size, addr);
 
 		struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, idx_tx++);
 
 		tx_desc->options = eop ? 0 : XDP_PKT_CONTD;
 		tx_desc->addr = orig;
-		tx_desc->len = len;
+		tx_desc->len = size;
 
 		if (eop) {
 			frags_done += nb_frags;
@@ -1876,7 +1913,7 @@ static int lookup_bpf_map(int prog_fd)
 			continue;
 		}
 
-		if (!strncmp(map_info.name, "xsks_map", sizeof(map_info.name)) &&
+		if (!strncmp(map_info.name, "udp_xsks_map", sizeof(map_info.name)) &&
 		    map_info.key_size == 4 && map_info.value_size == 4) {
 			xsks_map_fd = fd;
 			break;
@@ -1891,19 +1928,9 @@ static int lookup_bpf_map(int prog_fd)
 
 static void enter_xsks_into_map(void)
 {
-	struct bpf_map *data_map;
 	int i, xsks_map;
 	int key = 0;
 
-	data_map = bpf_object__find_map_by_name(xdp_program__bpf_obj(xdp_prog), ".bss");
-	if (!data_map || !bpf_map__is_internal(data_map)) {
-		fprintf(stderr, "ERROR: bss map found!\n");
-		exit(EXIT_FAILURE);
-	}
-	if (bpf_map_update_elem(bpf_map__fd(data_map), &key, &num_socks, BPF_ANY)) {
-		fprintf(stderr, "ERROR: bpf_map_update_elem num_socks %d!\n", num_socks);
-		exit(EXIT_FAILURE);
-	}
 	xsks_map = lookup_bpf_map(xdp_program__fd(xdp_prog));
 	if (xsks_map < 0) {
 		fprintf(stderr, "ERROR: no xsks map found: %s\n",
@@ -1915,10 +1942,10 @@ static void enter_xsks_into_map(void)
 		int fd = xsk_socket__fd(xsks[i]->xsk);
 		int ret;
 
-		key = i;
+		key = dport;
 		ret = bpf_map_update_elem(xsks_map, &key, &fd, 0);
 		if (ret) {
-			fprintf(stderr, "ERROR: bpf_map_update_elem %d\n", i);
+			fprintf(stderr, "ERROR: bpf_map_update_elem %d, %d\n", key, ret);
 			exit(EXIT_FAILURE);
 		}
 	}
@@ -1947,77 +1974,32 @@ static void apply_setsockopt(struct xsk_socket_info *xsk)
 		exit_with_error(errno);
 }
 
-static int recv_xsks_map_fd_from_ctrl_node(int sock, int *_fd)
+static int get_pinned_object_fd(const char *path, void *info, __u32 *info_len)
 {
-	char cms[CMSG_SPACE(sizeof(int))];
-	struct cmsghdr *cmsg;
-	struct msghdr msg;
-	struct iovec iov;
-	int value;
-	int len;
+	char errmsg[STRERR_BUFSIZE];
+	int pin_fd, err;
 
-	iov.iov_base = &value;
-	iov.iov_len = sizeof(int);
-
-	msg.msg_name = 0;
-	msg.msg_namelen = 0;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_flags = 0;
-	msg.msg_control = (caddr_t)cms;
-	msg.msg_controllen = sizeof(cms);
-
-	len = recvmsg(sock, &msg, 0);
-
-	if (len < 0) {
-		fprintf(stderr, "Recvmsg failed length incorrect.\n");
-		return -EINVAL;
-	}
-
-	if (len == 0) {
-		fprintf(stderr, "Recvmsg failed no data\n");
-		return -EINVAL;
-	}
-
-	cmsg = CMSG_FIRSTHDR(&msg);
-	*_fd = *(int *)CMSG_DATA(cmsg);
-
-	return 0;
-}
-
-static int
-recv_xsks_map_fd(int *xsks_map_fd)
-{
-	struct sockaddr_un server;
-	int err;
-
-	sock = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (sock < 0) {
-		fprintf(stderr, "Error opening socket stream: %s", strerror(errno));
-		return errno;
-	}
-
-	server.sun_family = AF_UNIX;
-	strcpy(server.sun_path, SOCKET_NAME);
-
-	if (connect(sock, (struct sockaddr *)&server, sizeof(struct sockaddr_un)) < 0) {
-		close(sock);
-		fprintf(stderr, "Error connecting stream socket: %s", strerror(errno));
-		return errno;
-	}
-
-	err = recv_xsks_map_fd_from_ctrl_node(sock, xsks_map_fd);
-	if (err) {
-		fprintf(stderr, "Error %d receiving fd\n", err);
+	pin_fd = bpf_obj_get(path);
+	if (pin_fd < 0) {
+		err = -errno;
+		libbpf_strerror(-err, errmsg, sizeof(errmsg));
 		return err;
 	}
-	return 0;
+
+	if (info) {
+		err = bpf_obj_get_info_by_fd(pin_fd, info, info_len);
+		if (err) {
+			err = -errno;
+			libbpf_strerror(-err, errmsg, sizeof(errmsg));
+			return err;
+		}
+	}
+
+	return pin_fd;
 }
 
 int main(int argc, char **argv)
 {
-	struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
-	struct __user_cap_data_struct data[2] = { { 0 } };
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 	bool rx = false, tx = false;
 	struct sched_param schparam;
@@ -2029,34 +2011,12 @@ int main(int argc, char **argv)
 
 	parse_command_line(argc, argv);
 
-	if (opt_reduced_cap) {
-		if (capget(&hdr, data)  < 0)
-			fprintf(stderr, "Error getting capabilities\n");
-
-		data->effective &= CAP_TO_MASK(CAP_NET_RAW);
-		data->permitted &= CAP_TO_MASK(CAP_NET_RAW);
-
-		if (capset(&hdr, data) < 0)
-			fprintf(stderr, "Setting capabilities failed\n");
-
-		if (capget(&hdr, data)  < 0) {
-			fprintf(stderr, "Error getting capabilities\n");
-		} else {
-			fprintf(stderr, "Capabilities EFF %x Caps INH %x Caps Per %x\n",
-				data[0].effective, data[0].inheritable, data[0].permitted);
-			fprintf(stderr, "Capabilities EFF %x Caps INH %x Caps Per %x\n",
-				data[1].effective, data[1].inheritable, data[1].permitted);
-		}
-	} else {
-		if (setrlimit(RLIMIT_MEMLOCK, &r)) {
-			fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
-				strerror(errno));
-			exit(EXIT_FAILURE);
-		}
-
-		if (load_xdp_prog)
-			load_xdp_program();
+	if (setrlimit(RLIMIT_MEMLOCK, &r)) {
+		fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
+			strerror(errno));
+		exit(EXIT_FAILURE);
 	}
+	load_xdp_program();
 
 	/* Reserve memory for the umem. Use hugepages if unaligned chunk mode */
 	bufs = mmap(NULL, NUM_FRAMES * opt_xsk_frame_size,
@@ -2092,23 +2052,28 @@ int main(int argc, char **argv)
 	}
 	frames_per_pkt = (opt_pkt_size - 1) / XSK_UMEM__DEFAULT_FRAME_SIZE + 1;
 
-	if (load_xdp_prog && opt_bench != BENCH_TXONLY)
+	//if (load_xdp_prog && opt_bench != BENCH_TXONLY)
 		enter_xsks_into_map();
 
-	if (opt_reduced_cap) {
-		ret = recv_xsks_map_fd(&xsks_map_fd);
-		if (ret) {
-			fprintf(stderr, "Error %d receiving xsks_map_fd\n", ret);
-			exit_with_error(ret);
-		}
-		if (xsks[0]->xsk) {
-			ret = xsk_socket__update_xskmap(xsks[0]->xsk, xsks_map_fd);
-			if (ret) {
-				fprintf(stderr, "Update of BPF map failed(%d)\n", ret);
-				exit_with_error(ret);
-			}
-		}
+	/*struct bpf_map_info info = {};
+	__u32 info_len = sizeof(info);
+	xsks_map_fd = get_pinned_object_fd("/var/run/lixdp/tc/globals/udp_xsks_map", &info, &info_len);
+	if (xsks_map_fd < 0) {
+		printf("Couldn't find %s map.\n", "/var/run/lixdp/tc/globals/udp_xsks_map");
+		exit(EXIT_FAILURE);
 	}
+
+	if (xsks[0]->xsk) {
+		int fd = xsk_socket__fd(xsks[0]->xsk);
+		int ret;
+
+		int key = dport;
+		ret = bpf_map_update_elem(xsks_map_fd, &key, &fd, 0);
+		if (ret) {
+			fprintf(stderr, "ERROR: bpf_map_update_elem %d, %d\n", key, ret);
+			exit(EXIT_FAILURE);
+		}
+	}*/
 
 	signal(SIGINT, int_exit);
 	signal(SIGTERM, int_exit);
